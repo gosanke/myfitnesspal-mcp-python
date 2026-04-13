@@ -11,6 +11,12 @@ Authentication Methods (in order of priority):
 3. Browser cookies: Chrome/Firefox (fallback)
 """
 
+
+# Apply curl_cffi patch to bypass Cloudflare TLS fingerprinting
+try:
+    from mfp_mcp.cffi_patch import _patch_applied
+except ImportError:
+    _patch_applied = False
 import json
 import logging
 import os
@@ -224,6 +230,19 @@ def get_mfp_client():
     import myfitnesspal
     
     last_error = None
+    
+    # Method 0: curl_cffi bypass (Cloudflare-resistant)
+    if _patch_applied:
+        logger.info("curl_cffi patch active, attempting direct cookie auth")
+        try:
+            dummy_jar = CookieJar()
+            client = myfitnesspal.Client(cookiejar=dummy_jar)
+            _ = client.get_date(date.today())
+            logger.info("Successfully authenticated via curl_cffi bypass")
+            return client
+        except Exception as e:
+            last_error = e
+            logger.warning(f"curl_cffi bypass failed: {e}")
     
     # Method 1: Try environment variable credentials
     username = os.environ.get("MFP_USERNAME")
