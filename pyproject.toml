@@ -8,7 +8,9 @@ version = "1.0.0"
 description = "MCP Server for MyFitnessPal - track food diary, exercises, measurements, and nutrition goals"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+# Upper bound is due to lxml (via myfitnesspal): no wheels for 3.13+ at the
+# time of writing, and building from source fails against the 3.14 C API.
+requires-python = ">=3.10,<3.13"
 authors = [
     { name = "Adam" }
 ]
@@ -34,13 +36,17 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # mcp 2.0.0 (released 2026-07-28) removed `mcp.server.fastmcp`, which
+    # server.py imports as its FastMCP base class. Pin below 2.0 until the
+    # server is ported to the new API.
+    "mcp>=1.0.0,<2.0.0",
     "myfitnesspal>=2.0.0",
     "pydantic>=2.0.0",
     "httpx>=0.24.0",
     "browser-cookie3>=0.19.0",
     "pint>=0.22",
     "keyring>=24.0.0",
+    "cryptography>=41.0.0",
 ]
 
 [project.optional-dependencies]
@@ -75,3 +81,4 @@ target-version = "py310"
 python_version = "3.10"
 warn_return_any = true
 warn_unused_ignores = true
+
