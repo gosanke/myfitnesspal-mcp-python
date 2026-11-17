@@ -64,6 +64,39 @@ MFP_API_BASE = "https://api.myfitnesspal.com"
 MFP_CLIENT_ID = "mfp-main-js"
 VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
 
+# Standard names (and Norwegian equivalents) for MFP's first four meal slots.
+# Users can rename slots in MFP (e.g. slot 0 "Grap-and-go"); the v2 diary API
+# then wants the user's own name plus meal_position, and silently misfiles an
+# entry sent under a name the account does not have (seen 2026-11-17: a
+# "Breakfast" entry landed in Dinner). resolve_meal() maps either form.
+MEAL_ALIASES = {
+    "breakfast": 0, "frokost": 0,
+    "lunch": 1, "lunsj": 1,
+    "dinner": 2, "middag": 2,
+    "snack": 3, "snacks": 3,
+}
+
+
+def resolve_meal(meal: str, meal_names) -> tuple:
+    """
+    Map a requested meal to (the account's meal name, meal_position).
+
+    Matches the account's own meal names case-insensitively first, then the
+    standard aliases by slot position. Raises ValueError for anything else.
+    """
+    wanted = (meal or "").strip().lower()
+    names = list(meal_names) or list(VALID_MEALS)
+    for i, name in enumerate(names):
+        if name.strip().lower() == wanted:
+            return name, i
+    pos = MEAL_ALIASES.get(wanted)
+    if pos is not None and pos < len(names):
+        return names[pos], pos
+    raise ValueError(
+        f"Invalid meal {meal!r}. Expected one of: {', '.join(names)} "
+        f"(or Breakfast/Lunch/Dinner/Snacks for the first four slots)"
+    )
+
 
 # ============================================================================
 # Authentication Helper Functions
@@ -1118,7 +1151,7 @@ class AddFoodToDiaryInput(BaseModel):
     )
     meal: str = Field(
         default="Breakfast",
-        description="Meal name (e.g., 'Breakfast', 'Lunch', 'Dinner', 'Snacks')",
+        description="Meal name: the account's own meal name (e.g. 'Grap-and-go', 'Tilskudd') or Breakfast/Lunch/Dinner/Snacks for the first four slots",
     )
     date: Optional[str] = Field(
         default=None,
@@ -1249,7 +1282,7 @@ class RemoveFoodFromDiaryInput(BaseModel):
     meal: Optional[str] = Field(
         default=None,
         description=(
-            "Restrict matching to a meal: Breakfast, Lunch, Dinner, Snacks."
+            "Restrict matching to a meal: the account's own meal name or Breakfast/Lunch/Dinner/Snacks."
         ),
     )
     max_matches: int = Field(
@@ -1301,6 +1334,63 @@ def _mfp_api_headers(client, json_body: bool = False) -> Dict[str, str]:
     if json_body:
         headers["Content-Type"] = "application/json"
     return headers
+
+
+_MEAL_NAMES_CACHE: Dict[str, List[str]] = {}
+
+
+def get_user_meal_names(client) -> List[str]:
+    """The account's meal slot names, in order (cached per user)."""
+    key = str(client.user_id)
+    if key not in _MEAL_NAMES_CACHE:
+        response = client.session.get(
+            f"{MFP_API_BASE}/v2/users/{client.user_id}",
+            params={"fields[]": "diary_preferences"},
+            headers=_mfp_api_headers(client),
+            timeout=30,
+        )
+        names: List[str] = []
+        if response.status_code == 200:
+            prefs = (response.json().get("item") or {}).get("diary_preferences") or {}
+            names = [n for n in (prefs.get("meal_names") or []) if n]
+        if not names:
+            logger.warning("Could not read meal names; using MFP defaults")
+            return list(VALID_MEALS)
+        _MEAL_NAMES_CACHE[key] = names
+    return _MEAL_NAMES_CACHE[key]
+
+
+def parse_v2_search(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten a /v2/search/nutrition response into the tool's result rows."""
+    rows = []
+    for wrapper in payload.get("items") or []:
+        food = wrapper.get("item") or {}
+        if not food.get("id") or food.get("deleted"):
+            continue
+        nutr = food.get("nutritional_contents") or {}
+        size = (food.get("serving_sizes") or [{}])[0]
+        mult = size.get("nutrition_multiplier") or 1.0
+        energy = (nutr.get("energy") or {}).get("value")
+
+        def per_serving(v):
+            return None if v is None else round(v * mult, 1)
+
+        value = size.get("value")
+        serving = (
+            f"{value:g} {size.get('unit', '')}".strip() if value is not None else None
+        )
+        rows.append({
+            "name": food.get("description"),
+            "brand": food.get("brand_name") or "",
+            "serving": serving,
+            "calories": per_serving(energy),
+            "protein": per_serving(nutr.get("protein")),
+            "carbs": per_serving(nutr.get("carbohydrates")),
+            "fat": per_serving(nutr.get("fat")),
+            "verified": bool(food.get("verified")),
+            "mfp_id": str(food["id"]),
+        })
+    return rows
 
 
 def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
@@ -1625,16 +1715,16 @@ def add_food_to_diary(
     food = get_food_v2(client, mfp_id)
     serving_size = select_serving_size(food, unit)
 
-    meal_name = meal.strip().capitalize()
-    if meal_name not in VALID_MEALS:
-        raise RuntimeError(
-            f"Invalid meal {meal!r}. Expected one of: {', '.join(VALID_MEALS)}"
-        )
+    try:
+        meal_name, meal_position = resolve_meal(meal, get_user_meal_names(client))
+    except ValueError as e:
+        raise RuntimeError(str(e)) from None
 
     entry = {
         "type": "food_entry",
         "date": target_date.strftime("%Y-%m-%d"),
         "meal_name": meal_name,
+        "meal_position": meal_position,
         "servings": float(quantity),
         "food": {"id": str(food["id"]), "version": str(food["version"])},
         "serving_size": serving_size,
@@ -1945,23 +2035,19 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     try:
         client = get_mfp_client()
-        results = client.get_food_search_results(params.query)
+        # v2 JSON search. The library's HTML scraper (get_food_search_results)
+        # silently returns 0 results since MFP changed the page (2026-11-17).
+        response = client.session.get(
+            f"{MFP_API_BASE}/v2/search/nutrition",
+            params={"q": params.query, "max_items": params.limit},
+            headers=_mfp_api_headers(client),
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"v2 food search failed: HTTP {response.status_code}")
+        results = parse_v2_search(response.json())[: params.limit]
 
-        # Limit results
-        results = results[: params.limit]
-
-        data = {"query": params.query, "count": len(results), "results": []}
-
-        for item in results:
-            data["results"].append(
-                {
-                    "name": item.name,
-                    "brand": item.brand,
-                    "serving": item.serving,
-                    "calories": item.calories,
-                    "mfp_id": item.mfp_id,
-                }
-            )
+        data = {"query": params.query, "count": len(results), "results": results}
 
         return format_response(
             data, params.response_format, f"Food Search Results for '{params.query}'"
@@ -2434,11 +2520,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         
-        # Normalize meal name (capitalize first letter)
-        meal = params.meal.strip().capitalize()
-        if meal.lower() == "snack":
-            meal = "Snacks"
-        
+        meal = params.meal  # resolved against the account's meal names
+
         # Add food to diary
         entry_id = add_food_to_diary(
             client=client,
@@ -2529,9 +2612,14 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
         entries = list_diary_entries(client, target_date)
         needle = params.name_contains.lower()
-        meal_filter = (
-            params.meal.lower() if params.meal else None
-        )
+        meal_filter = None
+        if params.meal:
+            try:
+                meal_filter = resolve_meal(
+                    params.meal, get_user_meal_names(client)
+                )[0].lower()
+            except ValueError:
+                meal_filter = params.meal.lower()
 
         matches = []
         for e in entries:
